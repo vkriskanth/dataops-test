@@ -1,4 +1,4 @@
-from example_etl.job import transform
+from pipelines.examples.example_etl.job import transform
 
 
 def test_transform_aggregates(spark):

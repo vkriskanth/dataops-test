@@ -30,7 +30,7 @@
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
         "python.testing.pytestEnabled": true,
-        "python.testing.pytestArgs": ["libs", "pipelines"],
+        "python.testing.pytestArgs": ["libs", "tests"],
         "[python]": { "editor.defaultFormatter": "charliermarsh.ruff", "editor.formatOnSave": true }
       }
     }

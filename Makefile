@@ -13,7 +13,7 @@ fmt:
 	ruff check --fix . && ruff format .
 
 run-example:
-	python -m example_etl.job
+	python -m pipelines.examples.example_etl.job
 
 jupyter:
 	jupyter lab --ip=0.0.0.0 --no-browser
