@@ -5,6 +5,9 @@ description = "Spark 4 data engineering monorepo"
 requires-python = ">=3.12"
 dependencies = ["common"]
 
+[dependency-groups]
+dev = ["ruff", "pylint", "pyrefly", "pytest", "pytest-cov", "chispa"]
+
 [tool.uv.workspace]
 members = ["libs/*"]
 
@@ -28,3 +31,19 @@ src = ["libs/*/src", "src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.pylint.main]
+source-roots = ["src", "libs/common/src"]
+jobs = 0
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint."messages control"]
+# Docstring rules, and style checks already owned by ruff
+disable = ["C0114", "C0115", "C0116", "C0301", "C0411", "C0412", "C0413", "W0611"]
+
+[tool.pyrefly]
+project-includes = ["src", "libs/*/src", "tests", "libs/*/tests"]
+search-path = ["src", "libs/common/src"]
+python-version = "3.12"
