@@ -1,13 +1,19 @@
-.PHONY: install test lint fmt run-example jupyter
+.PHONY: install test typecheck lint ci fmt run-example jupyter
 
 install:
-	uv sync --all-packages --inexact
+	uv sync --all-packages --inexact --group dev
 
 test:
 	pytest
 
+typecheck:
+	pyrefly check
+
 lint:
 	ruff check . && ruff format --check .
+	pylint src libs/common/src tests libs/common/tests
+
+ci: lint typecheck test
 
 fmt:
 	ruff check --fix . && ruff format .
