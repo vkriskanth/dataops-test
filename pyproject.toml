@@ -1,0 +1,27 @@
+[project]
+name = "dataops"
+version = "0.1.0"
+description = "Spark 4 data engineering monorepo"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["libs/*", "pipelines/*"]
+
+[tool.uv.sources]
+common = { workspace = true }
+example-etl = { workspace = true }
+
+[dependency-groups]
+dev = ["common", "example-etl"]
+
+[tool.pytest.ini_options]
+testpaths = ["libs", "pipelines"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+src = ["libs/*/src", "pipelines/*/src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
