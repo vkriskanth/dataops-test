@@ -32,9 +32,11 @@ def deploy_pipeline(pipeline: str, version: str, env: str, namespace: str) -> di
     ``dataops==<version>`` and ``common==<version>``, and leave the schedule untouched so
     deployment and activation stay separate.
     """
-    area, name = pipeline.split(".", 1)
-    module = f"pipelines.{area}.{name}.job"
-    job_name = f"{env}-{namespace + '-' if namespace else ''}{area}-{name}"
+    # Pipeline ids are already dotted module paths, flat ("sales_agg") or nested
+    # ("examples.example_etl"), so no splitting is needed for either layout.
+    module = f"pipelines.{pipeline}.job"
+    prefix = f"{namespace}-" if namespace else ""
+    job_name = f"{env}-{prefix}{pipeline.replace('.', '-')}"
 
     print(f"  [{env}] {pipeline}")
     print(f"        job name   : {job_name}")

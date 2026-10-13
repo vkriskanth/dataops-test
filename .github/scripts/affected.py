@@ -27,10 +27,18 @@ IGNORED_PREFIXES = ("data/", ".vscode/", ".devcontainer/devcontainer.json")
 
 
 def discover() -> list[str]:
-    """Every pipeline in the tree, as dotted ids: ``examples.example_etl``."""
-    return sorted(
+    """Every pipeline in the tree, as dotted ids.
+
+    Both layouts are recognised, so a pipeline is never misread as a shared change:
+
+      src/pipelines/<area>/<name>/job.py  ->  "<area>.<name>"   (README convention)
+      src/pipelines/<name>/job.py         ->  "<name>"          (flat)
+    """
+    ids = {job.parent.name for job in PIPELINE_ROOT.glob("*/job.py")}
+    ids |= {
         f"{job.parent.parent.name}.{job.parent.name}" for job in PIPELINE_ROOT.glob("*/*/job.py")
-    )
+    }
+    return sorted(ids)
 
 
 def _rev_exists(rev: str) -> bool:
@@ -66,13 +74,18 @@ def classify(files: list[str], all_pipelines: list[str]) -> tuple[bool, list[str
         if _ignored(path):
             continue
         parts = Path(path).parts
-        if len(parts) >= 5 and parts[:2] == ("src", "pipelines"):
-            pid = f"{parts[2]}.{parts[3]}"
-            if pid in all_pipelines:
-                touched.add(pid)
+        if len(parts) >= 4 and parts[:2] == ("src", "pipelines"):
+            # Prefer the nested id, fall back to the flat one.
+            nested = f"{parts[2]}.{parts[3]}" if len(parts) >= 5 else None
+            if nested and nested in all_pipelines:
+                touched.add(nested)
+                continue
+            if parts[2] in all_pipelines:
+                touched.add(parts[2])
                 continue
             # A pipeline that no longer exists, or an unexpected layout. Be conservative.
             return True, all_pipelines
+        # Anything else is shared: libs/, pyproject, uv.lock, CI, src/pipelines/__init__.py
         return True, all_pipelines
     return False, sorted(touched)
 
