@@ -1,0 +1,154 @@
+name: Build release artifact
+
+# Builds ONE artifact per commit on main. This is the only place a wheel is ever
+# produced -- QAT and PRD download it, they never rebuild. That is what makes "the
+# thing QA validated" and "the thing that shipped" the same bytes.
+
+on:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      channel:
+        type: string
+        default: rc
+        description: "main (continuous) or rc (frozen release candidate)"
+      base:
+        type: string
+        default: ""
+        description: "rev to diff against for scope; defaults to the last prod tag"
+    outputs:
+      version:
+        value: ${{ jobs.build.outputs.version }}
+      pipelines:
+        value: ${{ jobs.build.outputs.pipelines }}
+      blanket:
+        value: ${{ jobs.build.outputs.blanket }}
+
+concurrency:
+  group: build-${{ inputs.channel || 'main' }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      pipelines: ${{ steps.affected.outputs.pipelines }}
+      blanket: ${{ steps.affected.outputs.blanket }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          VERSION="$(date -u +'%Y.%-m.%-d').${{ github.run_number }}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "::notice::building ${VERSION} (channel ${{ inputs.channel || 'main' }})"
+
+      - name: Determine scope
+        id: affected
+        run: |
+          BASE="${{ inputs.base }}"
+          if [ -z "$BASE" ]; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              BASE="${{ github.event.before }}"
+            else
+              BASE=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
+            fi
+          fi
+          echo "Diffing against: ${BASE:-<none, will treat as blanket>}"
+          python3 .github/scripts/affected.py --base "$BASE" --head HEAD --github-output
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Stamp version and build wheels
+        run: |
+          python3 .github/scripts/stamp_version.py "${{ steps.version.outputs.version }}"
+          uv build --package common --out-dir dist
+          uv build --out-dir dist
+          ls -la dist
+
+      # Everything a later promotion needs to know, travelling with the artifact.
+      - name: Write build-info.json
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from datetime import UTC, datetime
+
+          def sh(*args):
+              return subprocess.run(args, capture_output=True, text=True).stdout.strip()
+
+          prs = sorted({
+              line.split("#")[1].split(")")[0].split()[0]
+              for line in sh("git", "log", "--pretty=%s", "-50").splitlines()
+              if "#" in line and line.split("#")[1][:1].isdigit()
+          }, key=lambda s: -int(s))
+
+          info = {
+              "version": os.environ["VERSION"],
+              "channel": os.environ["CHANNEL"],
+              "sha": sh("git", "rev-parse", "HEAD"),
+              "ref": os.environ["REF"],
+              "built_at": datetime.now(UTC).isoformat(),
+              "built_by_run": os.environ.get("GITHUB_RUN_ID", ""),
+              "blanket": os.environ["BLANKET"] == "true",
+              "pipelines": [p for p in os.environ["PIPELINES"].split(",") if p],
+              "recent_prs": prs[:50],
+          }
+          with open("dist/build-info.json", "w", encoding="utf-8") as fh:
+              json.dump(info, fh, indent=2)
+          print(json.dumps(info, indent=2))
+          PY
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ inputs.channel || 'main' }}
+          REF: ${{ inputs.ref || github.ref }}
+          BLANKET: ${{ steps.affected.outputs.blanket }}
+          PIPELINES: ${{ steps.affected.outputs.pipelines }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ steps.version.outputs.version }}
+          path: dist/
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          {
+            echo "### Built \`${{ steps.version.outputs.version }}\`"
+            echo
+            echo "- channel: \`${{ inputs.channel || 'main' }}\`"
+            echo "- commit: \`$(git rev-parse --short HEAD)\`"
+            echo "- scope: ${{ steps.affected.outputs.blanket == 'true' && 'BLANKET' || 'TARGETED' }}"
+            echo "- pipelines: \`${{ steps.affected.outputs.pipelines }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Continuous QAT from main: problems surface hours after merging, not during
+  # release week. QAT utilisation is a few percent, so this costs essentially nothing.
+  qat:
+    if: github.event_name == 'push'
+    needs: build
+    uses: ./.github/workflows/deploy-qat.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+      pipelines: ${{ needs.build.outputs.pipelines }}
+      blanket: ${{ needs.build.outputs.blanket }}
+      channel: main
+    permissions:
+      contents: read
+      actions: read

@@ -1,0 +1,167 @@
+name: Deploy to production
+
+# Thursday after CAB (or Friday if a re-cut was needed).
+#
+# This workflow PROMOTES an artifact. It does not build one. There is no checkout-and-
+# compile in the deploy path, so what ships is byte-identical to what QA validated.
+#
+# The `pipelines` input is how CAB selectivity works: it scopes WHAT GETS DEPLOYED, not
+# what gets built. If CAB rejects one item, you deploy the other 99 and that one keeps
+# running its previously deployed version. Nothing is cherry-picked, nothing is rebuilt,
+# and the rejected work stays in main to ride a later train.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version validated in QAT, e.g. 2026.10.14.1"
+        required: true
+      change_record:
+        description: "CAB change record, e.g. CHG0041234"
+        required: true
+      pipelines:
+        description: "CAB-approved pipelines: 'all' or comma-separated ids"
+        default: all
+        required: true
+      skip_soak_check:
+        description: "Hotfix only -- bypass the minimum QAT soak"
+        type: boolean
+        default: false
+
+concurrency:
+  group: prod
+  cancel-in-progress: false
+
+permissions:
+  contents: write # tagging the release
+  actions: read # downloading the built artifact
+
+env:
+  MIN_SOAK_HOURS: "24"
+
+jobs:
+  # Gate checks run BEFORE the environment approval, so a reviewer is never asked to
+  # approve a deploy that was going to fail its own preconditions.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.info.outputs.sha }}
+      approved: ${{ steps.info.outputs.approved }}
+      blanket: ${{ steps.info.outputs.blanket }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the built artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch_artifact.sh "dist-${{ inputs.version }}" dist
+
+      - name: Fetch the QAT deployment record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/fetch_artifact.sh \
+            "qat-${{ inputs.version }}" records --optional
+
+      - name: Gate checks
+        run: |
+          QAT_RECORD=""
+          [ -f records/qat.json ] && QAT_RECORD="records/qat.json"
+          python3 .github/scripts/verify_release.py \
+            --build-info dist/build-info.json \
+            --qat-record "$QAT_RECORD" \
+            --version "${{ inputs.version }}" \
+            --pipelines "${{ inputs.pipelines }}" \
+            --min-soak-hours "${{ env.MIN_SOAK_HOURS }}" \
+            --skip-soak-check "${{ inputs.skip_soak_check }}"
+
+      - name: Export release facts
+        id: info
+        run: |
+          {
+            echo "sha=$(python3 -c "import json;print(json.load(open('dist/build-info.json'))['sha'])")"
+            echo "blanket=$(python3 -c "import json;print(str(json.load(open('dist/build-info.json'))['blanket']).lower())")"
+            echo "approved=$(cat approved_pipelines.txt)"
+          } >> "$GITHUB_OUTPUT"
+
+  # Full suite at the exact commit the artifact was built from. Weekly cadence means
+  # the cost is irrelevant and the confidence is worth far more than a targeted run.
+  test:
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      UV_FROZEN: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --group dev
+      - run: uv run ruff check .
+      - run: uv run pylint src libs/common/src tests libs/common/tests
+      - run: uv run pyrefly check
+      - run: uv run pytest
+
+  deploy:
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    environment: prd # protection rule: required reviewers. This is the human gate.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the built artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch_artifact.sh "dist-${{ inputs.version }}" dist
+
+      - name: Deploy approved pipelines
+        run: |
+          python3 .github/scripts/deploy.py \
+            --env prd \
+            --version "${{ inputs.version }}" \
+            --pipelines "${{ needs.verify.outputs.approved }}" \
+            --blanket "${{ needs.verify.outputs.blanket }}" \
+            --change-record "${{ inputs.change_record }}" \
+            --record "records/prd.json"
+
+      # The tag is a receipt: it records which artifact was promoted and to what. It is
+      # not a build trigger, and it points at the commit the artifact came from.
+      - name: Tag the release
+        run: |
+          TAG="v${{ inputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+            echo "::notice::${TAG} already exists -- this version was promoted before"
+          else
+            git tag -a "$TAG" "${{ needs.verify.outputs.sha }}" \
+              -m "Release ${{ inputs.version }} (${{ inputs.change_record }})"
+            git push origin "$TAG"
+            echo "::notice::tagged ${TAG}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prd-${{ inputs.version }}
+          path: records/prd.json
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          {
+            echo "### Production now running \`${{ inputs.version }}\`"
+            echo
+            echo "- change record: \`${{ inputs.change_record }}\`"
+            echo "- commit: \`${{ needs.verify.outputs.sha }}\`"
+            echo "- tag: \`v${{ inputs.version }}\`"
+            echo "- deployed: \`${{ needs.verify.outputs.approved }}\`"
+            echo
+            echo "Rolling back means re-running this workflow with the previous version."
+            echo "The artifact still exists and is bit-identical."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,120 @@
+name: Deploy to QAT
+
+# Downloads an already-built artifact and deploys it. Never builds, never checks out
+# source to compile. Two callers:
+#
+#   * build-release on every push to main -- continuous integration confidence
+#   * cut-release on Monday -- the frozen release candidate QA validates all week
+#
+# Concurrency queues rather than cancels: aborting halfway through leaves job
+# definitions in a half-updated state.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      pipelines:
+        type: string
+        required: true
+      blanket:
+        type: string
+        default: "false"
+      channel:
+        type: string
+        default: rc
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy, e.g. 2026.10.14.1"
+        required: true
+      pipelines:
+        description: "'all' or comma-separated ids"
+        default: all
+        required: true
+
+concurrency:
+  group: qat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: qat
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the built artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/fetch_artifact.sh "dist-${{ inputs.version }}" dist
+
+      - name: Resolve scope
+        id: scope
+        run: |
+          REQUESTED="${{ inputs.pipelines }}"
+          BUILT=$(python3 -c "import json;print(','.join(json.load(open('dist/build-info.json'))['pipelines']))")
+          BLANKET=$(python3 -c "import json;print(str(json.load(open('dist/build-info.json'))['blanket']).lower())")
+          if [ "$REQUESTED" = "all" ] || [ -z "$REQUESTED" ]; then
+            REQUESTED="$BUILT"
+          fi
+          echo "pipelines=${REQUESTED}" >> "$GITHUB_OUTPUT"
+          echo "blanket=${BLANKET}" >> "$GITHUB_OUTPUT"
+          echo "Release contains: ${BUILT}"
+          echo "Deploying:        ${REQUESTED}"
+
+      - name: Deploy
+        run: |
+          python3 .github/scripts/deploy.py \
+            --env qat \
+            --version "${{ inputs.version }}" \
+            --pipelines "${{ steps.scope.outputs.pipelines }}" \
+            --blanket "${{ steps.scope.outputs.blanket }}" \
+            --record "records/qat.json"
+
+      # A blanket change invalidates every earlier pipeline-level sign-off, because
+      # pipelines validated before it ran against a different version of libs/common.
+      # This is the step whose absence silently breaks staggered per-PR testing.
+      - uses: actions/setup-java@v4
+        if: steps.scope.outputs.blanket == 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.scope.outputs.blanket == 'true'
+        with:
+          enable-cache: true
+
+      - name: Full suite against shared-code change
+        if: steps.scope.outputs.blanket == 'true'
+        env:
+          UV_FROZEN: "1"
+        run: |
+          echo "::warning::shared code changed -- every pipeline sign-off is stale, revalidating all"
+          uv sync --all-packages --group dev
+          uv run pytest
+
+      # Proof the version reached QAT. deploy-prod refuses to promote without it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qat-${{ inputs.version }}
+          path: records/qat.json
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          {
+            echo "QAT now running \`${{ inputs.version }}\`"
+            echo
+            echo "Channel: \`${{ inputs.channel || 'manual' }}\`"
+            echo
+            echo "QA signs off per pipeline against **this** version. Record sign-off in"
+            echo "the change record -- deploy-prod verifies the version reached QAT and"
+            echo "soaked long enough, but the sign-off itself is the CAB decision."
+          } >> "$GITHUB_STEP_SUMMARY"

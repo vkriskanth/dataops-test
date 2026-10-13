@@ -1,0 +1,123 @@
+name: Deploy to dev
+
+# Developer-driven. No peer review required -- this is the developer's own sandbox and
+# the only gate is PR checks. Run it from your feature branch.
+#
+# Isolation comes from DATAOPS_NAMESPACE: every developer writes under their own prefix,
+# so 40 people can deploy to dev at once without touching each other's data. Inputs are
+# read-only and shared; only outputs are namespaced.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pipelines:
+        description: "'auto' (detect from diff), 'all', or comma-separated ids"
+        default: auto
+        required: true
+      smoke_run:
+        description: "Actually execute the affected pipelines after deploying"
+        type: boolean
+        default: true
+
+concurrency:
+  group: dev-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve namespace
+        id: ns
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR=$(gh pr view "${{ github.ref_name }}" --json number --jq .number 2>/dev/null || true)
+          if [ -n "$PR" ]; then
+            NS="pr${PR}"
+          else
+            NS=$(echo "${{ github.ref_name }}" \
+              | tr '[:upper:]' '[:lower:]' | tr '/_' '--' \
+              | tr -cd 'a-z0-9-' | cut -c1-40)
+          fi
+          echo "namespace=${NS}" >> "$GITHUB_OUTPUT"
+          echo "::notice::dev namespace = ${NS}"
+
+      - name: Determine scope
+        id: affected
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main || true
+          BASE=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
+          python3 .github/scripts/affected.py \
+            --base "$BASE" --head HEAD \
+            --override "${{ inputs.pipelines }}" \
+            --github-output
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build wheels
+        id: build
+        run: |
+          VERSION="0.0.0.dev0+$(git rev-parse --short HEAD)"
+          python3 .github/scripts/stamp_version.py "$VERSION"
+          uv build --package common --out-dir dist
+          uv build --out-dir dist
+          git checkout -- pyproject.toml libs/*/pyproject.toml
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Deploy
+        run: |
+          python3 .github/scripts/deploy.py \
+            --env dev \
+            --version "${{ steps.build.outputs.version }}" \
+            --pipelines "${{ steps.affected.outputs.pipelines }}" \
+            --blanket "${{ steps.affected.outputs.blanket }}" \
+            --namespace "${{ steps.ns.outputs.namespace }}" \
+            --record "records/dev-${{ steps.ns.outputs.namespace }}.json"
+
+      # Proves the config seam end to end: reads shared input, writes to the namespace.
+      - uses: actions/setup-java@v4
+        if: inputs.smoke_run && steps.affected.outputs.count != '0'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Smoke run
+        if: inputs.smoke_run && steps.affected.outputs.count != '0'
+        env:
+          DATAOPS_ENV: dev
+          DATAOPS_BASE_PATH: ${{ github.workspace }}/data
+          DATAOPS_NAMESPACE: ${{ steps.ns.outputs.namespace }}
+          SPARK_MASTER: local[2]
+        run: |
+          uv sync --all-packages --group dev
+          IFS=',' read -ra PIPES <<< "${{ steps.affected.outputs.pipelines }}"
+          for pipe in "${PIPES[@]}"; do
+            echo "::group::Running ${pipe}"
+            uv run python -m "pipelines.${pipe}.job"
+            echo "::endgroup::"
+          done
+          echo "Outputs written under data/${DATAOPS_NAMESPACE}/:"
+          find "data/${DATAOPS_NAMESPACE}" -type f | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-${{ steps.ns.outputs.namespace }}-${{ github.run_id }}
+          path: records/
+          retention-days: 7
+          if-no-files-found: ignore

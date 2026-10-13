@@ -1,11 +1,11 @@
 """Example pipeline: raw CSV -> cleaned, aggregated parquet."""
 
 import argparse
-import os
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
+from common import config
 from common.spark import get_spark
 from common.transforms import snake_case_columns, with_ingest_ts
 
@@ -26,12 +26,12 @@ def run(spark: SparkSession, src: str, dst: str) -> None:
 
 
 def main() -> None:
-    data_dir = os.environ.get("DATA_DIR", "data")
+    cfg = config.load()
     p = argparse.ArgumentParser()
-    p.add_argument("--src", default=f"{data_dir}/raw/example.csv")
-    p.add_argument("--dst", default=f"{data_dir}/processed/example_agg")
+    p.add_argument("--src", default=cfg.source("raw/example.csv"))
+    p.add_argument("--dst", default=cfg.output("processed/example_agg"))
     args = p.parse_args()
-    run(get_spark("example_etl"), args.src, args.dst)
+    run(get_spark("example_etl", master=cfg.master), args.src, args.dst)
 
 
 if __name__ == "__main__":
