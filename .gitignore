@@ -9,3 +9,13 @@ metastore_db/
 derby.log
 data/processed/*
 !data/processed/.gitkeep
+
+# Namespaced dev output (DATAOPS_NAMESPACE), one dir per developer
+/data/*/
+!/data/raw/
+!/data/processed/
+
+# Release machinery scratch
+dist/
+records/
+approved_pipelines.txt

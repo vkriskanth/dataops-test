@@ -1,0 +1,19 @@
+# Blast radius drives review requirements, mirroring how it drives deploy scope:
+# a pipeline-local change needs a peer, a shared change needs the platform team.
+#
+# Replace these placeholder teams with your real ones before enabling.
+
+# Individual pipelines -- peer review within the data engineering group.
+/src/pipelines/            @data-engineers
+/tests/                    @data-engineers
+
+# Shared code. Any change here is a BLANKET deploy touching every pipeline.
+/libs/                     @platform-team
+
+# Dependency and build surface. Changes here are blanket too.
+/pyproject.toml            @platform-team
+/uv.lock                   @platform-team
+
+# The release machinery itself.
+/.github/                  @platform-team
+/.devcontainer/            @platform-team

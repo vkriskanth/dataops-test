@@ -1,0 +1,132 @@
+name: Cut release
+
+# Monday: freeze the week's release. Everything merged to main by now rides this train;
+# anything merged after it waits for next Monday.
+#
+# The release branch exists for exactly one reason: somewhere to land fixes to the
+# candidate without pulling in new main commits. It never accepts new features. Adding
+# features here is how you end up assembling untested combinations on CAB day.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1" # Monday 14:00 UTC
+  workflow_dispatch:
+    inputs:
+      deploy_date:
+        description: "Target prod date, YYYY-MM-DD (defaults to the coming Thursday)"
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch.outputs.branch }}
+      sha: ${{ steps.branch.outputs.sha }}
+      previous_tag: ${{ steps.branch.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Create the release branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TARGET="${{ inputs.deploy_date }}"
+          if [ -z "$TARGET" ]; then
+            TARGET=$(date -u -d "next Thursday" +%Y-%m-%d)
+          fi
+          BRANCH="release/${TARGET}"
+          PREV=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::${BRANCH} already exists. Land fixes on it, or delete it to re-cut."
+            exit 1
+          fi
+
+          git push origin "HEAD:refs/heads/${BRANCH}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "::notice::cut ${BRANCH} at $(git rev-parse --short HEAD)"
+
+      - name: Release contents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV="${{ steps.branch.outputs.previous_tag }}"
+          RANGE="${PREV:+${PREV}..}HEAD"
+          {
+            echo "## Release candidate for ${{ steps.branch.outputs.branch }}"
+            echo
+            echo "Cut from main at \`$(git rev-parse --short HEAD)\`"
+            echo "${PREV:+, previous release \`$PREV\`}"
+            echo
+            echo "### Changes in this release"
+            echo
+            echo "| PR | Change |"
+            echo "|---|---|"
+            git log --pretty='%s' "$RANGE" | grep -oE '.*\(#[0-9]+\)$' | while read -r line; do
+              NUM=$(echo "$line" | grep -oE '#[0-9]+' | tail -1 | tr -d '#')
+              TITLE=$(echo "$line" | sed -E 's/ *\(#[0-9]+\)$//')
+              echo "| #${NUM} | ${TITLE} |"
+            done
+            echo
+            echo "### Next steps"
+            echo
+            echo "1. QA validates this candidate in QAT (Mon-Wed), signing off **per pipeline**"
+            echo "2. Raise **one** change record listing these items for Thursday's CAB"
+            echo "3. After CAB, run **Deploy to production** with the version above and the"
+            echo "   approved pipeline list. Rejected items stay in main and ride a later train."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Same build workflow as main uses, so there is no second code path to drift.
+  build:
+    needs: cut
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ needs.cut.outputs.sha }}
+      channel: rc
+      base: ${{ needs.cut.outputs.previous_tag }}
+    permissions:
+      contents: read
+
+  qat:
+    needs: [cut, build]
+    uses: ./.github/workflows/deploy-qat.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+      pipelines: ${{ needs.build.outputs.pipelines }}
+      blanket: ${{ needs.build.outputs.blanket }}
+      channel: rc
+    permissions:
+      contents: read
+      actions: read
+
+  announce:
+    needs: [cut, build, qat]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Candidate is ready
+        run: |
+          {
+            echo "### Release candidate \`${{ needs.build.outputs.version }}\` is in QAT"
+            echo
+            echo "- branch: \`${{ needs.cut.outputs.branch }}\`"
+            echo "- pipelines: \`${{ needs.build.outputs.pipelines }}\`"
+            echo
+            echo "Promote with:"
+            echo '```'
+            echo "gh workflow run deploy-prod.yml \\"
+            echo "  -f version=${{ needs.build.outputs.version }} \\"
+            echo "  -f change_record=CHG0000000 \\"
+            echo "  -f pipelines=all"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
