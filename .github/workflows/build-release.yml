@@ -34,6 +34,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read # the nested deploy-qat call downloads the built artifact
 
 env:
   UV_FROZEN: "1"

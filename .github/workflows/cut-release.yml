@@ -88,6 +88,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Same build workflow as main uses, so there is no second code path to drift.
+  # Permissions can only narrow down a call chain, and GitHub validates the whole graph
+  # statically -- so this must also cover build-release's own nested deploy-qat call,
+  # even though that job is skipped for non-push events.
   build:
     needs: cut
     uses: ./.github/workflows/build-release.yml
@@ -97,6 +100,7 @@ jobs:
       base: ${{ needs.cut.outputs.previous_tag }}
     permissions:
       contents: read
+      actions: read
 
   qat:
     needs: [cut, build]
@@ -108,7 +112,7 @@ jobs:
       channel: rc
     permissions:
       contents: read
-      actions: read
+      actions: read # downloads the built artifact
 
   announce:
     needs: [cut, build, qat]
