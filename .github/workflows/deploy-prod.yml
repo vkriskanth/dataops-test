@@ -5,24 +5,36 @@ name: Deploy to production
 # This workflow PROMOTES an artifact. It does not build one. There is no checkout-and-
 # compile in the deploy path, so what ships is byte-identical to what QA validated.
 #
-# The `pipelines` input is how CAB selectivity works: it scopes WHAT GETS DEPLOYED, not
-# what gets built. If CAB rejects one item, you deploy the other 99 and that one keeps
-# running its previously deployed version. Nothing is cherry-picked, nothing is rebuilt,
-# and the rejected work stays in main to ride a later train.
+# `approved_prs` is how CAB selectivity works: give it the PR numbers CAB approved and
+# it resolves them to pipelines, then scopes WHAT GETS DEPLOYED. It never scopes what
+# gets BUILT, so nothing is cherry-picked and nothing is rebuilt -- what ships is
+# byte-identical to the candidate QA validated.
+#
+# A rejected PR's pipeline simply keeps running its previously deployed version. Two
+# situations cannot be resolved by scoping and will stop the deploy:
+#
+#   * a rejected PR changed shared code (libs/, uv.lock) -- that code is in the artifact
+#     and would run under every deployed pipeline
+#   * an approved and a rejected PR touched the same pipeline -- the artifact holds both
+#
+# Both mean slipping the release or re-cutting without the rejected PR. That is what the
+# Friday buffer is for.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version validated in QAT, e.g. 2026.10.14.1"
+        description: "Candidate version validated in QAT, e.g. 2026.10.14.1"
         required: true
       change_record:
         description: "CAB change record, e.g. CHG0041234"
         required: true
+      approved_prs:
+        description: "CAB-approved PR numbers, comma-separated (e.g. 101,103,104)"
+        default: ""
       pipelines:
-        description: "CAB-approved pipelines: 'all' or comma-separated ids"
-        default: all
-        required: true
+        description: "Alternative to approved_prs: 'all' or comma-separated pipeline ids"
+        default: ""
       skip_soak_check:
         description: "Hotfix only -- bypass the minimum QAT soak"
         type: boolean
@@ -50,6 +62,8 @@ jobs:
       blanket: ${{ steps.info.outputs.blanket }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Fetch the built artifact
         env:
@@ -63,15 +77,53 @@ jobs:
           bash .github/scripts/fetch_artifact.sh \
             "qat-${{ inputs.version }}" records --optional
 
+      - name: Require exactly one of approved_prs / pipelines
+        run: |
+          if [ -n "${{ inputs.approved_prs }}" ] && [ -n "${{ inputs.pipelines }}" ]; then
+            echo "::error::give approved_prs OR pipelines, not both"
+            exit 1
+          fi
+          if [ -z "${{ inputs.approved_prs }}" ] && [ -z "${{ inputs.pipelines }}" ]; then
+            echo "::error::give approved_prs (CAB numbers) or pipelines ('all' or ids)"
+            exit 1
+          fi
+
+      # Resolve CAB-approved PR numbers to a deployable pipeline set, refusing the two
+      # cases that scoping cannot express. Writes approved_pipelines.txt.
+      - name: Resolve approved PRs
+        id: prs
+        if: inputs.approved_prs != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_REF=$(python3 -c "import json;print(json.load(open('dist/build-info.json'))['ref'])")
+          RELEASE_BRANCH=${RELEASE_REF#refs/heads/}
+          SHA=$(python3 -c "import json;print(json.load(open('dist/build-info.json'))['sha'])")
+          git fetch --no-tags origin main:refs/remotes/origin/main 2>/dev/null || true
+          git fetch --no-tags origin "$SHA" 2>/dev/null || true
+          BASE=$(git merge-base origin/main "$SHA")
+          python3 .github/scripts/resolve_prs.py \
+            --approved "${{ inputs.approved_prs }}" \
+            --repo "${{ github.repository }}" \
+            --release-branch "$RELEASE_BRANCH" \
+            --base "$BASE" --head "$SHA" \
+            --github-output
+
       - name: Gate checks
         run: |
           QAT_RECORD=""
           [ -f records/qat.json ] && QAT_RECORD="records/qat.json"
+          if [ -n "${{ inputs.approved_prs }}" ]; then
+            SCOPE=$(cat approved_pipelines.txt)
+          else
+            SCOPE="${{ inputs.pipelines }}"
+          fi
+          echo "Scope to verify: $SCOPE"
           python3 .github/scripts/verify_release.py \
             --build-info dist/build-info.json \
             --qat-record "$QAT_RECORD" \
             --version "${{ inputs.version }}" \
-            --pipelines "${{ inputs.pipelines }}" \
+            --pipelines "$SCOPE" \
             --min-soak-hours "${{ env.MIN_SOAK_HOURS }}" \
             --skip-soak-check "${{ inputs.skip_soak_check }}"
 

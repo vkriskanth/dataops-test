@@ -1,0 +1,80 @@
+name: Open release
+
+# Start of cycle: create the integration branch that this week's work merges into.
+#
+# In this model the release branch -- not main -- is where feature branches land. main
+# only ever receives a completed, CAB-approved release, so main is a record of what is
+# actually in production.
+#
+# Only ONE release branch should be open at a time. Opening a second while the first is
+# unmerged means the second does not contain the first's work, and you will resolve that
+# divergence by hand. close-release deletes the branch, which is what makes the next one
+# safe to open.
+
+on:
+  schedule:
+    - cron: "0 13 * * 1" # Monday 13:00 UTC
+  workflow_dispatch:
+    inputs:
+      deploy_date:
+        description: "Target prod date, YYYY-MM-DD (defaults to the coming Thursday)"
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  open:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Refuse if a release is already open
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OPEN=$(git ls-remote --heads origin 'refs/heads/release/*' | awk '{print $2}' | sed 's#refs/heads/##')
+          if [ -n "$OPEN" ]; then
+            echo "::error::a release branch is already open:"
+            echo "$OPEN" | sed 's/^/  /'
+            echo "Finish it with close-release (which deletes the branch), or delete it"
+            echo "manually if it is being abandoned. Two open releases diverge."
+            exit 1
+          fi
+
+      - name: Create the release branch
+        id: branch
+        run: |
+          TARGET="${{ inputs.deploy_date }}"
+          if [ -z "$TARGET" ]; then
+            TARGET=$(date -u -d "next Thursday" +%Y-%m-%d)
+          fi
+          BRANCH="release/${TARGET}"
+          git push origin "HEAD:refs/heads/${BRANCH}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "::notice::opened ${BRANCH} at $(git rev-parse --short HEAD)"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release \`${{ steps.branch.outputs.branch }}\` is open"
+            echo
+            echo "Cut from main at \`$(git rev-parse --short HEAD)\`."
+            echo
+            echo "**Developers:** branch from \`${{ steps.branch.outputs.branch }}\` and open"
+            echo "your PR against it, not against main."
+            echo
+            echo '```bash'
+            echo "git fetch origin"
+            echo "git checkout -b feature/my-change origin/${{ steps.branch.outputs.branch }}"
+            echo "# ... work ..."
+            echo "gh pr create --base ${{ steps.branch.outputs.branch }} --draft --fill"
+            echo '```'
+            echo
+            echo "Each merge into the release branch rebuilds the candidate and refreshes"
+            echo "QAT. A tracking PR to main is created automatically on the first merge;"
+            echo "its body is the CAB manifest."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -9,15 +9,18 @@ Prose details live in [release-process.md](release-process.md).
 
 ## 1. The whole path, start to finish
 
-One artifact is built on merge to `main` and the **same bytes** are promoted onward.
-Nothing after the build ever recompiles from source.
+Feature work merges into the **release branch**. `main` receives only a completed,
+CAB-approved release, so `main` records what is in production. One artifact is built per
+merge, and the **same bytes** are promoted onward — nothing after the build recompiles.
 
 ```mermaid
 flowchart LR
-    subgraph loop["Developer loop — any day, no coordination"]
+    OPEN["open-release<br/>Monday<br/>release/thu-date"] --> REL
+
+    subgraph loop["Developer loop — any day during the cycle"]
         direction TB
-        FB["feature branch"]
-        DPR["draft PR"]
+        FB["feature branch<br/>off the release branch"]
+        DPR["draft PR<br/>base = release branch"]
         DEVENV["dev<br/>namespace pr-N"]
         FB --> DPR
         DPR -. "manual dispatch" .-> DEVENV
@@ -25,23 +28,29 @@ flowchart LR
 
     loop --> CI["CI<br/>lint, types, targeted tests"]
     CI --> REV{"peer review"}
-    REV -- approved --> MAIN["main<br/>always releasable"]
+    REV -- approved --> REL["release branch<br/>integration"]
 
-    MAIN --> BUILD["build-release<br/>wheel 2026.10.14.N"]
-    BUILD --> QATC["QAT<br/>continuous from main"]
+    REL --> BUILD["build-release<br/>wheel 2026.10.14.N"]
+    BUILD --> QAT["QAT<br/>refreshed every merge"]
+    BUILD --> MANI["tracking PR to main<br/>= CAB manifest"]
 
-    MAIN -. "Monday 14:00" .-> CUT["cut-release<br/>freeze release/thu-date"]
-    CUT --> RC["release candidate<br/>one artifact"]
-    RC --> QATR["QAT<br/>candidate under test"]
-    QATR --> QA{"QA sign-off<br/>per pipeline"}
+    QAT --> QA{"QA sign-off<br/>per pipeline"}
     QA --> CAB{"CAB<br/>Thursday"}
-    CAB -- "approved subset" --> PROD["PRD<br/>scoped promote + tag"]
-    CAB -- rejected --> DORM["stays in main<br/>dormant"]
-    DORM -. "later train" .-> CAB
+
+    CAB -- "approved PR numbers" --> PROD["deploy-prod<br/>scoped, same bytes"]
+    CAB -- "rejected" --> HELD["pipeline held back<br/>keeps previous version"]
+
+    PROD --> CLOSE["close-release<br/>merge to main + tag"]
+    HELD --> CLOSE
+    CLOSE --> MAIN["main<br/>= what is in production"]
+    MAIN -. "next cycle" .-> OPEN
 ```
 
-The two QAT boxes are the same environment. It tracks `main` continuously so problems
-surface hours after merging, and holds the frozen candidate during release week.
+Only **one** release branch is open at a time. `open-release` refuses to create a second
+one, because two open releases diverge and you resolve that by hand.
+
+Held-back code still merges to `main` as part of the release — dormant, never deployed,
+and eligible for the next release with no cherry-picking.
 
 ---
 
@@ -51,25 +60,30 @@ Developers work on their own schedule. Only the release track is dated.
 
 ```mermaid
 gantt
-    title Release week
+    title One release cycle
     dateFormat YYYY-MM-DD
     axisFormat %a
     todayMarker off
 
-    section Developers
-    Merge to main, QAT refreshes continuously :active, d1, 2026-10-12, 11d
+    section Branch
+    Open release branch        :milestone, m0, 2026-10-19, 0d
+    Feature PRs merge into it  :active, d1, 2026-10-19, 3d
+    Merge to main + tag        :milestone, m5, 2026-10-22, 0d
 
-    section Release track
-    Cut RC and freeze          :milestone, m1, 2026-10-19, 0d
-    QA validates the candidate :crit, qa, 2026-10-19, 3d
+    section Validation
+    QAT refreshed every merge  :q1, 2026-10-19, 3d
+    QA sign-off per pipeline   :crit, qa, 2026-10-21, 2d
+
+    section Approval
     One change record raised   :milestone, m2, 2026-10-21, 0d
     CAB review                 :milestone, m3, 2026-10-22, 0d
     Production deploy          :milestone, m4, 2026-10-22, 0d
     Buffer, only if re-cut     :buf, 2026-10-23, 1d
 ```
 
-A change merged Tuesday waits for the following Monday's cut and ships about nine days
-later. That is the cost of weekly CAB, not a limitation of the pipeline.
+Work that misses the cycle waits for the next release branch. Because `main` only moves
+at the end, the next cycle's branch must be opened **after** the previous one merges —
+`open-release` enforces this by refusing to create a second open release branch.
 
 ---
 
@@ -108,62 +122,80 @@ sees `blanket=true`.
 sequenceDiagram
     autonumber
     participant D as Developers
-    participant M as main
+    participant R as release/2026-10-16
     participant Q as QAT
-    participant R as Release manager
+    participant C as CAB
     participant P as PRD
+    participant M as main
 
-    Note over D,Q: 10/14 — each merge refreshes QAT within minutes
-    D->>M: 09:00  dev_2 merges
-    M->>Q: deploy — TARGETED
-    D->>M: 10:00  dev_1 merges
-    M->>Q: deploy — TARGETED
-    D->>M: 13:00  dev_3 merges
-    M->>Q: deploy — TARGETED
-    D->>M: 16:00  dev_4 merges libs/
-    M->>Q: deploy — BLANKET
-    Note over Q: full suite re-runs;<br/>dev_1 and dev_3 sign-offs refreshed<br/>against the final combined state
+    Note over R: 10/12 — open-release creates the branch from main
 
-    R->>R: Mon — cut RC, freeze, build once
-    Q->>R: QA signs off per pipeline
-    R->>P: Thu after CAB — promote approved subset
-    Note over P: same bytes QA validated
+    Note over D,Q: 10/14 — each merge rebuilds the candidate and refreshes QAT
+    D->>R: 09:00  PR #102 dev_2 merges
+    R->>Q: deploy — TARGETED
+    D->>R: 10:00  PR #101 dev_1 merges
+    R->>Q: deploy — TARGETED
+    D->>R: 13:00  PR #103 dev_3 merges
+    R->>Q: deploy — TARGETED
+    D->>R: 16:00  PR #104 dev_4 merges libs/
+    R->>Q: deploy — BLANKET
+    Note over Q: full suite re-runs;<br/>#101 and #103 sign-offs refreshed<br/>against the final combined state
+
+    Q->>C: 10/15 QA signs off per pipeline
+    Note over C: approves #101 #103 #104<br/>rejects #102
+    C->>P: 10/16 deploy-prod approved_prs=101,103,104
+    Note over P: dev_2_pipeline held back,<br/>keeps its previous version
+    P->>M: close-release — merge + tag v2026.10.14.1
+    Note over M: #102's code is in main,<br/>dormant, rides the next release
 ```
 
 Every developer still gets same-day feedback. Nobody waits for a QAT slot, because QAT is
 never a resource one PR holds.
 
+Note step 8: dev_4's shared change lands **last**, which stales the sign-offs from steps
+4 and 6. The blanket revalidation is what makes staggered per-PR testing safe.
+
 ---
 
-## 5. One artifact, selective deployment
+## 5. Approved PR numbers to a deployed pipeline set
 
-How CAB rejects a single item without anyone cherry-picking.
+You hand `deploy-prod` the PR numbers CAB approved. It resolves them to pipelines and
+scopes the deploy — no cherry-picking, no rebuild.
 
 ```mermaid
 flowchart TD
-    A["artifact 2026.10.14.1<br/>built once from main"] --> Q["QAT — all four pipelines<br/>validated together"]
+    A["artifact 2026.10.14.1<br/>contains PRs #101 #102 #103 #104"] --> Q["QAT — validated together"]
     Q --> CAB{"CAB Thursday"}
+    CAB --> IN["approved_prs = 101,103,104"]
 
-    CAB -- approved --> OK["dev_1, dev_3, common"]
-    CAB -- rejected --> NO["dev_2"]
+    IN --> RES["resolve_prs.py<br/>PR numbers → changed files → pipelines"]
+    RES --> CHK{"can scoping<br/>express this?"}
 
-    OK --> DEP["deploy-prod<br/>version = 2026.10.14.1<br/>pipelines = dev_1, dev_3, examples"]
+    CHK -- yes --> DEP["deploy-prod<br/>pipelines = dev_1, dev_3, examples"]
     DEP --> LIVE["PRD runs 2026.10.14.1"]
+    DEP --> HOLD["dev_2_pipeline held back —<br/>keeps its previous version"]
 
-    NO --> HOLD["dev_2 keeps its<br/>previously deployed version"]
-    HOLD --> STAY["code stays merged in main,<br/>dormant — never deployed"]
-    STAY --> NEXT["rides a later train:<br/>same artifact, no rebuild,<br/>no cherry-pick"]
+    CHK -- "rejected PR touched libs/" --> X1["REFUSE<br/>shared code is in the artifact<br/>and runs under every pipeline"]
+    CHK -- "approved + rejected PR<br/>touched the same pipeline" --> X2["REFUSE<br/>artifact holds both changes"]
+
+    X1 --> OPT["slip the release,<br/>or re-cut without it<br/>(Friday buffer)"]
+    X2 --> OPT
 
     style DEP fill:#14532d,stroke:#16a34a,color:#f0fdf4
-    style NEXT fill:#1e3a5f,stroke:#3b82f6,color:#eff6ff
+    style X1 fill:#7f1d1d,stroke:#dc2626,color:#fef2f2
+    style X2 fill:#7f1d1d,stroke:#dc2626,color:#fef2f2
 ```
 
 The approved list scopes **what gets deployed**, never what gets built. That is the whole
 difference between this and assembling code on release day — the artifact promoted to
 production is byte-identical to the one QA tested.
 
-Per-pipeline `common==<version>` pinning is what makes the exclusion real: `dev_2` keeps
-running against its old shared code rather than silently picking up the new one.
+Per-pipeline `common==<version>` pinning is what makes a held-back pipeline real: `dev_2`
+keeps running against its old shared code instead of silently picking up the new one.
+
+The two red paths are not pessimism — they are the cases where "deploy only the approved
+PRs" is not a thing that can be done without building something nobody tested. The
+workflow stops instead of pretending.
 
 ---
 

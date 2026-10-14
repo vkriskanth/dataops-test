@@ -26,28 +26,39 @@ Create `src/pipelines/<area>/<etl>/` (with `__init__.py` and `job.py`) and a tes
 
 ## Development and release flow
 
-One artifact is built on merge to `main` and the **same bytes** are promoted to QAT and
-then production. Environments differ only by injected config, never by code.
+Feature branches merge into the **release branch**, never into `main`. `main` receives
+only a completed, CAB-approved release — so `main` is a record of what is in production.
+
+One artifact is built per merge to the release branch, and the **same bytes** are
+promoted to QAT and then production. Environments differ only by injected config.
 
 ```mermaid
 flowchart LR
-    FB["feature<br/>branch"] --> PR["draft PR<br/>+ CI"]
+    FB["feature<br/>branch"] --> PR["PR into<br/>release branch"]
     PR -. "deploy-dev<br/>(no review needed)" .-> DEV["dev<br/>namespace pr-N"]
     PR --> REV{"peer<br/>review"}
-    REV --> MAIN["main"]
-    MAIN --> ART["one artifact<br/>2026.10.14.N"]
+    REV --> REL["release/&lt;date&gt;"]
+    REL --> ART["one artifact<br/>2026.10.14.N"]
     ART --> QAT["QAT"]
     QAT --> CAB{"CAB<br/>Thursday"}
-    CAB -- "approved<br/>pipelines" --> PROD["PRD<br/>same bytes"]
-    CAB -- rejected --> HOLD["dormant in main,<br/>rides a later train"]
+    CAB -- "approved<br/>PR numbers" --> PROD["PRD<br/>same bytes,<br/>scoped deploy"]
+    PROD --> MAIN["main + tag<br/>close-release"]
+    CAB -- rejected --> HOLD["pipeline held back;<br/>code still merges to main,<br/>dormant"]
+    HOLD --> MAIN
 ```
 
 | Stage | Trigger | Gate |
 |---|---|---|
 | dev | manual, from your branch | PR checks only |
-| QAT | automatic on merge to `main` | none |
-| release candidate | Monday 14:00 UTC | frozen; QA validates Mon–Wed |
-| production | manual, after CAB | `prd` environment approval |
+| QAT | automatic on merge to the release branch | none |
+| production | manual, approved PR numbers after CAB | `prd` environment approval |
+| `main` | manual, after production | production deploy record required |
+
+Production selectivity works by **scoping the deploy, not the build**: give
+`deploy-prod` the CAB-approved PR numbers and it resolves them to pipelines. A rejected
+PR's pipeline keeps its previous version. Nothing is cherry-picked and nothing is
+rebuilt. Two cases cannot be expressed by scoping and are refused — a rejected PR that
+changed `libs/`, and an approved plus a rejected PR touching the same pipeline.
 
 - **[docs/workflow-diagrams.md](docs/workflow-diagrams.md)** — five diagrams: the full path,
   weekly cadence, blast radius, a four-developer day, and selective deployment

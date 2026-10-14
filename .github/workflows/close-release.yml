@@ -1,0 +1,167 @@
+name: Close release
+
+# End of cycle: merge the completed release into main and tag it.
+#
+# main receives code ONLY from here, never from a feature branch. So main is a record of
+# what has actually been through CAB and reached production -- which is the whole point
+# of routing feature work through the release branch first.
+#
+# This runs AFTER the production deploy, not before, and refuses to run without a
+# production deployment record for the version. Merging first would put code in main
+# that CAB might still reject.
+#
+# Note what lands in main: the ENTIRE release branch, including PRs whose pipelines were
+# held back. Their code is in main but was never deployed -- dormant, and eligible for
+# the next release without any cherry-picking. That is deliberate; surgically removing
+# them would diverge main from the artifact that was actually tested.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version that was deployed to production, e.g. 2026.10.14.1"
+        required: true
+      change_record:
+        description: "CAB change record, for the tag message"
+        required: true
+      delete_branch:
+        description: "Delete the release branch after merging (do this -- open-release refuses while one exists)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: close-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the build and production records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/fetch_artifact.sh "dist-${{ inputs.version }}" dist
+          bash .github/scripts/fetch_artifact.sh "prd-${{ inputs.version }}" records --optional
+
+      - name: Require a production deploy first
+        id: check
+        run: |
+          if [ ! -f records/prd.json ]; then
+            echo "::error::no production deployment record for ${{ inputs.version }}."
+            echo "Run 'Deploy to production' before closing the release -- main must not"
+            echo "receive code that has not shipped."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          info = json.load(open("dist/build-info.json"))
+          prd = json.load(open("records/prd.json"))
+          errs = []
+          if prd.get("version") != os.environ["VERSION"]:
+              errs.append(f"prd record is for {prd.get('version')!r}")
+          if prd.get("env") != "prd":
+              errs.append(f"prd record env is {prd.get('env')!r}")
+          deployed = [p["pipeline"] for p in prd.get("pipelines", [])]
+          held = sorted(set(info.get("pipelines", [])) - set(deployed))
+          for e in errs:
+              print(f"::error::{e}")
+          if errs:
+              raise SystemExit(1)
+          branch = info.get("ref", "").removeprefix("refs/heads/")
+          print(f"Release branch : {branch}")
+          print(f"Deployed       : {', '.join(deployed)}")
+          print(f"Held back      : {', '.join(held) or '(none)'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"branch={branch}\n")
+              fh.write(f"sha={info.get('sha','')}\n")
+              fh.write(f"deployed={','.join(deployed)}\n")
+              fh.write(f"held={','.join(held)}\n")
+          PY
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Merge the release into main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          if [ -z "$BRANCH" ]; then
+            echo "::error::build-info.json has no release branch ref"
+            exit 1
+          fi
+          # A merge commit, not a squash: main's history should show the release as the
+          # unit it was tested and approved as.
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            gh pr ready "$BRANCH" 2>/dev/null || true
+            gh pr merge "$BRANCH" --merge --admin \
+              --subject "Release ${{ inputs.version }} (${{ inputs.change_record }})"
+            echo "::notice::merged release PR for ${BRANCH} into main"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout main && git pull --ff-only
+            git merge --no-ff "origin/${BRANCH}" \
+              -m "Release ${{ inputs.version }} (${{ inputs.change_record }})"
+            git push origin main
+            echo "::notice::merged ${BRANCH} into main directly (no PR found)"
+          fi
+
+      - name: Tag the release on main
+        run: |
+          TAG="v${{ inputs.version }}"
+          git fetch --no-tags origin main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+            echo "::notice::${TAG} already exists"
+          else
+            git tag -a "$TAG" origin/main \
+              -m "Release ${{ inputs.version }} (${{ inputs.change_record }})
+          Deployed: ${{ steps.check.outputs.deployed }}
+          Held back: ${{ steps.check.outputs.held }}"
+            git push origin "$TAG"
+            echo "::notice::tagged ${TAG} on main"
+          fi
+
+      - name: Delete the release branch
+        if: inputs.delete_branch
+        env:
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          git push origin --delete "$BRANCH" 2>/dev/null \
+            && echo "::notice::deleted ${BRANCH}" \
+            || echo "::warning::could not delete ${BRANCH} (already gone?)"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release \`${{ inputs.version }}\` closed"
+            echo
+            echo "- merged \`${{ steps.check.outputs.branch }}\` into main"
+            echo "- tagged \`v${{ inputs.version }}\`"
+            echo "- change record: \`${{ inputs.change_record }}\`"
+            echo
+            echo "**Deployed to production:** \`${{ steps.check.outputs.deployed }}\`"
+            echo
+            HELD="${{ steps.check.outputs.held }}"
+            if [ -n "$HELD" ]; then
+              echo "**Held back:** \`$HELD\`"
+              echo
+              echo "Their code is now in main but was never deployed. It is dormant and"
+              echo "will be included in the next release automatically -- no cherry-pick."
+              echo "Re-run deploy-prod for them once CAB approves, or let the next"
+              echo "candidate carry them."
+            fi
+            echo
+            echo "Run **Open release** to start the next cycle."
+          } >> "$GITHUB_STEP_SUMMARY"

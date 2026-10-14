@@ -1,12 +1,17 @@
 name: Build release artifact
 
-# Builds ONE artifact per commit on main. This is the only place a wheel is ever
-# produced -- QAT and PRD download it, they never rebuild. That is what makes "the
+# Builds ONE artifact per commit on a release branch. This is the only place a wheel is
+# ever produced -- QAT and PRD download it, they never rebuild. That is what makes "the
 # thing QA validated" and "the thing that shipped" the same bytes.
+#
+# Feature branches merge into release/<date>, so every push here rebuilds the candidate
+# with the accumulated release contents. Scope is computed against main, not against the
+# previous push, so build-info.json always describes the WHOLE release -- deploy-prod
+# relies on that list to validate the CAB-approved subset.
 
 on:
   push:
-    branches: [main]
+    branches: ["release/**"]
   workflow_call:
     inputs:
       ref:
@@ -15,11 +20,11 @@ on:
       channel:
         type: string
         default: rc
-        description: "main (continuous) or rc (frozen release candidate)"
+        description: "rc (release candidate) or main"
       base:
         type: string
         default: ""
-        description: "rev to diff against for scope; defaults to the last prod tag"
+        description: "rev to diff against for scope; defaults to the merge base with main"
     outputs:
       version:
         value: ${{ jobs.build.outputs.version }}
@@ -59,16 +64,16 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "::notice::building ${VERSION} (channel ${{ inputs.channel || 'main' }})"
 
+      # Always diff against main, so the artifact describes the whole release rather
+      # than just the last merge into it. deploy-prod validates the CAB-approved subset
+      # against this list, so a partial list would wrongly reject approved pipelines.
       - name: Determine scope
         id: affected
         run: |
           BASE="${{ inputs.base }}"
           if [ -z "$BASE" ]; then
-            if [ "${{ github.event_name }}" = "push" ]; then
-              BASE="${{ github.event.before }}"
-            else
-              BASE=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
-            fi
+            git fetch --no-tags --depth=0 origin main:refs/remotes/origin/main 2>/dev/null || true
+            BASE=$(git merge-base origin/main HEAD 2>/dev/null || echo "")
           fi
           echo "Diffing against: ${BASE:-<none, will treat as blanket>}"
           python3 .github/scripts/affected.py --base "$BASE" --head HEAD --github-output
@@ -139,8 +144,75 @@ jobs:
             echo "- pipelines: \`${{ steps.affected.outputs.pipelines }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Continuous QAT from main: problems surface hours after merging, not during
-  # release week. QAT utilisation is a few percent, so this costs essentially nothing.
+  # The tracking PR to main is the release record and the CAB manifest. Refreshed on
+  # every merge so it always lists the current candidate version and its contents.
+  manifest:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or refresh the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PIPELINES: ${{ needs.build.outputs.pipelines }}
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main 2>/dev/null || true
+          BASE=$(git merge-base origin/main HEAD)
+
+          {
+            echo "## Release \`${BRANCH}\`"
+            echo
+            echo "Candidate: **\`${VERSION}\`**"
+            echo
+            echo "Pipelines in this release: \`${PIPELINES}\`"
+            echo
+            echo "### Contents"
+            echo
+            echo "| PR | Change |"
+            echo "|---|---|"
+            git log --pretty='%s' "${BASE}..HEAD" | while read -r line; do
+              NUM=$(printf '%s' "$line" | grep -oE '#[0-9]+' | tail -1 | tr -d '#')
+              [ -n "$NUM" ] || continue
+              TITLE=$(printf '%s' "$line" | sed -E 's/^Merge pull request #[0-9]+ from \S+//; s/ *\(#[0-9]+\)$//')
+              echo "| #${NUM} | ${TITLE:-(see PR)} |"
+            done
+            echo
+            echo "### Production deploy"
+            echo
+            echo "After CAB, run **Deploy to production** with the approved PR numbers:"
+            echo
+            echo '```bash'
+            echo "gh workflow run deploy-prod.yml \\"
+            echo "  -f version=${VERSION} \\"
+            echo "  -f approved_prs=101,103,104 \\"
+            echo "  -f change_record=CHG0000000"
+            echo '```'
+            echo
+            echo "Then **Close release** to merge this PR into main and tag."
+          } > /tmp/body.md
+
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            gh pr edit "$BRANCH" --body-file /tmp/body.md
+            echo "::notice::refreshed release PR for ${BRANCH}"
+          else
+            gh pr create --base main --head "$BRANCH" --draft \
+              --title "Release ${BRANCH#release/}" --body-file /tmp/body.md \
+              && echo "::notice::opened release PR for ${BRANCH}" \
+              || echo "::warning::could not open release PR yet (no commits vs main?)"
+          fi
+          cat /tmp/body.md >> "$GITHUB_STEP_SUMMARY"
+
+  # QAT tracks the release candidate: every merge into the release branch refreshes it,
+  # so developers get same-day feedback and QA always tests the real release contents.
   qat:
     if: github.event_name == 'push'
     needs: build
@@ -149,7 +221,7 @@ jobs:
       version: ${{ needs.build.outputs.version }}
       pipelines: ${{ needs.build.outputs.pipelines }}
       blanket: ${{ needs.build.outputs.blanket }}
-      channel: main
+      channel: rc
     permissions:
       contents: read
       actions: read
